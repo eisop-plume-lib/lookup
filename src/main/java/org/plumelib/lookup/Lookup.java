@@ -2,6 +2,8 @@ package org.plumelib.lookup;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -30,21 +32,20 @@ import org.plumelib.util.RegexUtil;
  * <p>A file can contain one or more entries, each of which is a short entry or a long entry.
  *
  * <ul>
- *   <li>A short entry is a single paragraph (delimited from the next entry by a blank line). Lookup
- *       searches all of a short entry.
+ *   <li>A short entry is a single paragraph (delimited from the next entry by one or two blank
+ *       lines (default: 1). Lookup searches all of a short entry.
  *   <li>A long entry is introduced by a line that begins with '{@code >entry}'. The remainder of
  *       that line is a one-line description of the entry. A long entry is terminated by '{@code
  *       <entry}', by the start of a new long entry, or by the start of a new file. Lookup searches
  *       only the first line of a long entry.
  * </ul>
  *
- * <p>If multiple entries match, the first line of each is printed. If only one entry matches, then
- * that entry is printed in its entirety.
+ * <p>All matching entries are printed.
  *
- * <p>By default, Lookup searches the file ~/lookup/root. Files can contain comments and can include
- * other files. Comments start with a % sign in the first column. Any comment line is ignored (it is
- * not treated as a blank line for the purpose of separating entries). A file can include another
- * file via a line of the form '\include{filename}'.
+ * <p>By default, Lookup searches the file {@code ~/lookup/root}. Files can contain comments and can
+ * include other files. Comments start with a % sign in the first column by default. Any comment
+ * line is ignored. A comment line does not separate entries as a blank line does. A file can
+ * include another file via a line of the form '\include{filename}'.
  *
  * <p>The default behavior can be customized by way of command-line options.
  *
@@ -114,6 +115,10 @@ import org.plumelib.util.RegexUtil;
 @SuppressWarnings("deprecation") // uses deprecated classes in this package
 public final class Lookup {
 
+  // For plume-util 1.12.3 or later:
+  // /** If true, produce diagnostic output. */
+  // private static final boolean debug = false;
+
   /** This class is a collection of methods; it does not represent anything. */
   private Lookup() {
     throw new Error("do not instantiate");
@@ -153,9 +158,9 @@ public final class Lookup {
 
   /**
    * If true, match a text keyword only as a separate word, not as a substring of a word. This
-   * option is ignored if regular_expressions is true.
+   * option may be supplied together with {@code --regular-expressions}.
    */
-  @Option("-w Only match text keywords against complete words")
+  @Option("-w Only match search terms against complete words")
   public static boolean word_match = false;
 
   /**
@@ -177,8 +182,12 @@ public final class Lookup {
   @Option("-l Show the location of each matching entry")
   public static boolean show_location = false;
 
-  /** Matches the start of a long entry. */
+  /** If true, entries are separated by two blank lines. */
   @OptionGroup("Customizing format of files to be searched")
+  @Option("If true, entries are separated by two blank lines")
+  public static boolean two_blank_lines = false;
+
+  /** Matches the start of a long entry. */
   @Option("Regex that denotes the start of a long entry")
   public static @Regex(1) Pattern entry_start_re = Pattern.compile("^>entry *()");
 
@@ -208,9 +217,6 @@ public final class Lookup {
   @Option("-v Print progress information")
   public static boolean verbose = false;
 
-  /** Platform-specific line separator. */
-  private static final String lineSep = System.lineSeparator();
-
   /** One-line synopsis of usage. */
   private static final String usageString = "lookup [options] <keyword> ...";
 
@@ -220,15 +226,20 @@ public final class Lookup {
    * @param args command-line arguments; see documentation
    * @throws IOException if there is a problem reading a file
    */
-  @SuppressWarnings({
-    "StringSplitter" // don't add dependence on Guava
-  })
   public static void main(String[] args) throws IOException {
 
     Options options = new Options(usageString, Lookup.class);
     String[] keywords = options.parse(true, args);
 
-    // TODO: validate arguments.  Check that various options are @Regex or @Regex(1).
+    // Validate that regex options are valid regular expressions
+    if (comment_re != null && !RegexUtil.isRegex(comment_re)) {
+      System.err.println("Error: --comment-re is not a regex: " + comment_re);
+      System.exit(254);
+    }
+    if (!RegexUtil.isRegex(include_re, 1)) {
+      System.err.println("Error: --include-re is not a regex with 1 group: " + include_re);
+      System.exit(254);
+    }
 
     // If help was requested, print it and exit
     if (help) {
@@ -257,82 +268,89 @@ public final class Lookup {
       comment_re = null;
     }
 
-    // Open the first readable root file
-    EntryReader reader = null;
-    try {
-      String[] entryFiles = entry_file.split(":");
-      List<Exception> fileErrors = new ArrayList<>();
-      for (String ef : entryFiles) {
-        ef = FilesPlume.expandFilename(ef);
-        try {
-          reader = new EntryReader(ef, comment_re, include_re);
-        } catch (FileNotFoundException e) {
-          fileErrors.add(e);
-        }
-        if (reader != null) {
-          break;
-        }
+    // Find the first readable root file.
+    String rootFile = null;
+    for (String candidate_unexpanded : entry_file.split(":", -1)) {
+      String candidate = FilesPlume.expandFilename(candidate_unexpanded);
+      if (Files.isReadable(Path.of(candidate))) {
+        rootFile = candidate;
+        break;
       }
-      if (reader == null) {
-        System.out.println("Error: Can't read any entry files");
-        for (Exception fileError : fileErrors) {
-          System.out.printf("  entry file %s%n", fileError.getMessage());
-        }
-        System.exit(254);
+    }
+    if (rootFile == null) {
+      System.out.println("Error: Can't read any entry files.");
+      for (String unreadable : entry_file.split(":", -1)) {
+        System.out.printf("  entry file %s%n", FilesPlume.expandFilename(unreadable));
       }
+      System.exit(254);
+    }
 
-      // Setup the regular expressions for long entries
+    try (EntryReader reader = new EntryReader(rootFile, two_blank_lines, comment_re, include_re)) {
+      // For plume-util 1.12.3 or later:
+      // reader.setDebug(debug);
+
+      // Set up the regular expressions for long entries.
       reader.setEntryStartStop(entry_start_re, entry_stop_re);
 
       List<EntryReader.Entry> matchingEntries = new ArrayList<>();
 
+      // Precompute the regular expressions, for efficiency.
+      int flags = case_sensitive ? 0 : (Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
+      if (word_match) {
+        flags |= Pattern.UNICODE_CHARACTER_CLASS;
+      }
+      List<Pattern> patterns = new ArrayList<>();
+      if (regular_expressions) {
+        for (String keyword : keywords) {
+          if (!RegexUtil.isRegex(keyword)) {
+            System.out.println("Error: not a regex: " + keyword);
+            System.exit(254);
+          }
+          patterns.add(Pattern.compile(keyword, flags));
+        }
+      } else if (word_match) {
+        for (String keyword : keywords) {
+          String keywordRegex = "\\b" + Pattern.quote(keyword) + "\\b";
+          patterns.add(Pattern.compile(keywordRegex, flags));
+        }
+      } else if (!case_sensitive) {
+        for (int i = 0; i < keywords.length; i++) {
+          keywords[i] = keywords[i].toLowerCase(Locale.ROOT);
+        }
+      }
+
       try {
         // Process each entry looking for matches
         int entryCnt = 0;
+
         EntryReader.Entry entry = reader.getEntry();
         while (entry != null) {
           entryCnt++;
           if (verbose && ((entryCnt % 1000) == 0)) {
             System.out.printf("%d matches in %d entries\r", matchingEntries.size(), entryCnt);
           }
-          int matchcount = 0;
-          for (String keyword : keywords) {
-            String search = entry.getDescription(description_re);
-            if (search_body || entry.shortEntry) {
-              search = entry.body;
+          String toSearch =
+              (search_body || entry.shortEntry) ? entry.body : entry.getDescription(description_re);
+          boolean found = true;
+          if (!patterns.isEmpty()) {
+            for (Pattern pattern : patterns) {
+              if (!pattern.matcher(toSearch).find()) {
+                found = false;
+                break;
+              }
             }
+          } else {
             if (!case_sensitive) {
-              search = search.toLowerCase(Locale.getDefault());
+              toSearch = toSearch.toLowerCase(Locale.ROOT);
             }
-            if (regular_expressions) {
-              int flags = Pattern.CASE_INSENSITIVE;
-              if (case_sensitive) {
-                flags = 0;
-              }
-
-              if (!RegexUtil.isRegex(keyword)) {
-                System.out.println("Error: not a regex: " + keyword);
-                System.exit(254);
-              }
-
-              if (Pattern.compile(keyword, flags).matcher(search).find()) {
-                matchcount++;
-              }
-            } else {
-              if (!case_sensitive) {
-                keyword = keyword.toLowerCase(Locale.getDefault());
-              }
-              if (word_match) {
-                String keywordRegex = "\\b" + Pattern.quote(keyword) + "\\b";
-                if (Pattern.compile(keywordRegex).matcher(search).find()) {
-                  matchcount++;
-                }
-              } else if (search.contains(keyword)) {
-                matchcount++;
+            for (String keyword : keywords) {
+              if (!toSearch.contains(keyword)) {
+                found = false;
+                break;
               }
             }
           }
-          if (matchcount == keywords.length) {
+          if (found) {
             matchingEntries.add(entry);
           }
           entry = reader.getEntry();
@@ -345,23 +363,24 @@ public final class Lookup {
       }
 
       // Print the results
-      if (matchingEntries.size() == 0) {
+      int numMatchingEntries = matchingEntries.size();
+      if (numMatchingEntries == 0) {
         System.out.println("Nothing found.");
-      } else if (matchingEntries.size() == 1) {
+      } else if (numMatchingEntries == 1) {
         EntryReader.Entry e = matchingEntries.get(0);
         if (show_location) {
           System.out.printf("%s:%d:%n", e.filename, e.lineNumber);
         }
         System.out.print(e.body);
-      } else { // there must be multiple matches
+      } else { // there are multiple matches
         if (item_num != null) {
           if (item_num < 1) {
             System.out.printf("Illegal --item-num %d, should be positive%n", item_num);
             System.exit(1);
           }
-          if (item_num > matchingEntries.size()) {
+          if (item_num > numMatchingEntries) {
             System.out.printf(
-                "Illegal --item-num %d, should be <= %d%n", item_num, matchingEntries.size());
+                "Illegal --item-num %d, should be <= %d%n", item_num, numMatchingEntries);
             System.exit(1);
           }
           EntryReader.Entry e = matchingEntries.get(item_num - 1);
@@ -372,12 +391,11 @@ public final class Lookup {
         } else {
           int i = 0;
           if (print_all) {
-            System.out.printf(
-                "%d matches found (separated by dashes below)%n", matchingEntries.size());
+            System.out.printf("%d matches found (separated by dashes below)%n", numMatchingEntries);
           } else {
             System.out.printf(
-                "%d matches found. Use -i to print a specific match or -a to see them all%n",
-                matchingEntries.size());
+                "%d matches found. Use -i to print a specific match or -a to see them all.%n",
+                numMatchingEntries);
           }
 
           for (EntryReader.Entry e : matchingEntries) {
@@ -400,105 +418,6 @@ public final class Lookup {
           }
         }
       }
-    } finally {
-      if (reader != null) {
-        reader.close();
-      }
     }
-  }
-
-  /**
-   * Returns the next entry. If no more entries are available, returns null.
-   *
-   * @param reader where to read the entry from
-   * @return the next entry, or null
-   * @throws IOException if there is a problem reading a file
-   */
-  public static EntryReader.@Nullable Entry old_getEntry(EntryReader reader) throws IOException {
-
-    try {
-
-      // Skip any preceeding blank lines
-      String line = reader.readLine();
-      while ((line != null) && (line.trim().length() == 0)) {
-        line = reader.readLine();
-      }
-      if (line == null) {
-        return null;
-      }
-
-      EntryReader.Entry entry = null;
-      String filename = reader.getFileName();
-      long lineNumber = reader.getLineNumber();
-
-      // If this is a long entry
-      if (line.startsWith(">entry")) {
-
-        // Get the current filename
-        String currentFilename = reader.getFileName();
-
-        // Remove '>entry' from the line
-        line = line.replaceFirst("^>entry *", "");
-        String firstLine = line;
-
-        StringBuilder body = new StringBuilder();
-        // Read until we find the termination of the entry
-        while ((line != null)
-            && !line.startsWith(">entry")
-            && !line.equals("<entry")
-            && currentFilename.equals(reader.getFileName())) {
-          body.append(line);
-          body.append(lineSep);
-          line = reader.readLine();
-        }
-
-        // If this entry was terminated by the start of the next one,
-        // put that line back
-        if ((line != null)
-            && (line.startsWith(">entry") || !currentFilename.equals(reader.getFileName()))) {
-          reader.putback(line);
-        }
-
-        entry = new EntryReader.Entry(firstLine, body.toString(), filename, lineNumber, false);
-
-      } else { // blank separated entry
-
-        String firstLine = line;
-
-        StringBuilder body = new StringBuilder();
-        // Read until we find another blank line
-        while ((line != null) && (line.trim().length() != 0)) {
-          body.append(line);
-          body.append(lineSep);
-          line = reader.readLine();
-        }
-
-        entry = new EntryReader.Entry(firstLine, body.toString(), filename, lineNumber, true);
-      }
-
-      return entry;
-
-    } catch (FileNotFoundException e) {
-      System.out.printf(
-          "Error: Can't read %s at line %d in file %s%n",
-          e.getMessage(), reader.getLineNumber(), reader.getFileName());
-      System.exit(254);
-      return null;
-    }
-  }
-
-  /**
-   * Returns the first line of entry.
-   *
-   * @param entry the entry whose first line to return
-   * @return the first line of entry
-   */
-  public static String firstLine(String entry) {
-
-    int ii = entry.indexOf(lineSep);
-    if (ii == -1) {
-      return entry;
-    }
-    return entry.substring(0, ii);
   }
 }
