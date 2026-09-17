@@ -3,7 +3,7 @@ package org.plumelib.lookup;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -272,7 +272,7 @@ public final class Lookup {
     String rootFile = null;
     for (String candidate_unexpanded : entry_file.split(":", -1)) {
       String candidate = FilesPlume.expandFilename(candidate_unexpanded);
-      if (Files.isReadable(Path.of(candidate))) {
+      if (Files.isReadable(Paths.get(candidate))) {
         rootFile = candidate;
         break;
       }
